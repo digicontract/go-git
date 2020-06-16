@@ -3,6 +3,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/format/packfile"
+	"github.com/go-git/go-git/v5/plumbing/format/pktline"
 	"github.com/go-git/go-git/v5/plumbing/protocol/packp"
 	"github.com/go-git/go-git/v5/plumbing/protocol/packp/capability"
 	"github.com/go-git/go-git/v5/plumbing/revlist"
@@ -89,7 +91,7 @@ func (s *session) Close() error {
 }
 
 func (s *session) SetAuth(transport.AuthMethod) error {
-	//TODO: deprecate
+	// TODO: deprecate
 	return nil
 }
 
@@ -162,12 +164,52 @@ func (s *upSession) UploadPack(ctx context.Context, req *packp.UploadPackRequest
 		return nil, err
 	}
 
-	pr, pw := io.Pipe()
-	e := packfile.NewEncoder(pw, s.storer, false)
+	prRaw, pwRaw := io.Pipe()
+	e := packfile.NewEncoder(pwRaw, s.storer, false)
 	go func() {
 		// TODO: plumb through a pack window.
 		_, err := e.Encode(objs, 10)
-		pw.CloseWithError(err)
+		pwRaw.CloseWithError(err)
+	}()
+
+	pr, pw := io.Pipe()
+	go func() {
+	LOOP:
+		for {
+			var limit int
+			switch {
+			case s.caps.Supports(capability.Sideband):
+				limit = 999
+			case s.caps.Supports(capability.Sideband64k):
+				limit = 65519
+			default:
+				_, err := io.Copy(pw, prRaw)
+				pw.CloseWithError(err)
+				break LOOP
+			}
+
+			var err error
+			buffer := bytes.NewBuffer([]byte{1})
+			for buffer.Len() <= limit {
+				b := make([]byte, 1)
+				_, err = prRaw.Read(b)
+				if err != nil {
+					break
+				}
+				buffer.Write(b)
+			}
+
+			e := pktline.NewEncoder(pw)
+			if err := e.Encode(buffer.Bytes()); err != nil {
+				pw.CloseWithError(err)
+				break LOOP
+			}
+
+			if err != nil {
+				pw.CloseWithError(err)
+				break LOOP
+			}
+		}
 	}()
 
 	return packp.NewUploadPackResponseWithPackfile(req,
@@ -190,6 +232,14 @@ func (*upSession) setSupportedCapabilities(c *capability.List) error {
 	}
 
 	if err := c.Set(capability.OFSDelta); err != nil {
+		return err
+	}
+
+	if err := c.Set(capability.Sideband); err != nil {
+		return err
+	}
+
+	if err := c.Set(capability.Sideband64k); err != nil {
 		return err
 	}
 
@@ -241,7 +291,7 @@ func (s *rpSession) ReceivePack(ctx context.Context, req *packp.ReferenceUpdateR
 
 	s.caps = req.Capabilities
 
-	//TODO: Implement 'atomic' update of references.
+	// TODO: Implement 'atomic' update of references.
 
 	if req.Packfile != nil {
 		r := ioutil.NewContextReadCloser(ctx, req.Packfile)
@@ -398,7 +448,7 @@ func setHEAD(s storer.Storer, ar *packp.AdvRefs) error {
 }
 
 func setReferences(s storer.Storer, ar *packp.AdvRefs) error {
-	//TODO: add peeled references.
+	// TODO: add peeled references.
 	iter, err := s.IterReferences()
 	if err != nil {
 		return err
